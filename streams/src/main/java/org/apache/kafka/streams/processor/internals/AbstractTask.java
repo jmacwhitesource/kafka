@@ -17,11 +17,7 @@
 package org.apache.kafka.streams.processor.internals;
 
 import org.apache.kafka.clients.consumer.Consumer;
-import org.apache.kafka.clients.consumer.OffsetAndMetadata;
-import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.errors.AuthorizationException;
-import org.apache.kafka.common.errors.WakeupException;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.errors.LockException;
@@ -61,7 +57,7 @@ public abstract class AbstractTask implements Task {
      * @throws ProcessorStateException if the state manager cannot be created
      */
     AbstractTask(final TaskId id,
-                 final Collection<TopicPartition> partitions,
+                 final Set<TopicPartition> partitions,
                  final ProcessorTopology topology,
                  final Consumer<byte[], byte[]> consumer,
                  final ChangelogReader changelogReader,
@@ -248,19 +244,6 @@ public abstract class AbstractTask implements Task {
 
     public Collection<TopicPartition> changelogPartitions() {
         return stateMgr.changelogPartitions();
-    }
-
-    long committedOffsetForPartition(final TopicPartition partition) {
-        try {
-            final OffsetAndMetadata metadata = consumer.committed(partition);
-            return metadata != null ? metadata.offset() : 0L;
-        } catch (final AuthorizationException e) {
-            throw new ProcessorStateException(String.format("task [%s] AuthorizationException when initializing offsets for %s", id, partition), e);
-        } catch (final WakeupException e) {
-            throw e;
-        } catch (final KafkaException e) {
-            throw new ProcessorStateException(String.format("task [%s] Failed to initialize offsets for %s", id, partition), e);
-        }
     }
 
 }

@@ -351,6 +351,37 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             return;
         }
 
+        final AtomicReference<Exception> firstException = new AtomicReference<>(null);
+        Set<TopicPartition> addedPartitions = new HashSet<>(assignedPartitions);
+        addedPartitions.removeAll(ownedPartitions);
+
+        if (protocol == RebalanceProtocol.COOPERATIVE) {
+            Set<TopicPartition> revokedPartitions = new HashSet<>(ownedPartitions);
+            revokedPartitions.removeAll(assignedPartitions);
+
+            log.info("Updating assignment with\n" +
+                    "now assigned partitions: {}\n" +
+                    "compare with previously owned partitions: {}\n" +
+                    "newly added partitions: {}\n" +
+                    "revoked partitions: {}\n",
+                Utils.join(assignedPartitions, ", "),
+                Utils.join(ownedPartitions, ", "),
+                Utils.join(addedPartitions, ", "),
+                Utils.join(revokedPartitions, ", ")
+            );
+
+            if (!revokedPartitions.isEmpty()) {
+                // revoke partitions that were previously owned but no longer assigned;
+                // note that we should only change the assignment (or update the assignor's state)
+                // AFTER we've triggered  the revoke callback
+                firstException.compareAndSet(null, invokePartitionsRevoked(revokedPartitions));
+
+                // if revoked any partitions, need to re-join the group afterwards
+                log.debug("Need to revoke partitions {} and re-join the group", revokedPartitions);
+                requestRejoin();
+            }
+        }
+
         // The leader may have assigned partitions which match our subscription pattern, but which
         // were not explicitly requested, so we update the joined subscription here.
         maybeUpdateJoinedSubscription(assignedPartitions);
@@ -363,50 +394,10 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         if (autoCommitEnabled)
             this.nextAutoCommitTimer.updateAndReset(autoCommitIntervalMs);
 
-        // execute the user's callback after rebalance
-        final AtomicReference<Exception> firstException = new AtomicReference<>(null);
-        Set<TopicPartition> addedPartitions = new HashSet<>(assignedPartitions);
-        addedPartitions.removeAll(ownedPartitions);
+        subscriptions.assignFromSubscribed(assignedPartitions);
 
-        switch (protocol) {
-            case EAGER:
-                // assign partitions that are not yet owned
-                subscriptions.assignFromSubscribed(assignedPartitions);
-
-                firstException.compareAndSet(null, invokePartitionsAssigned(addedPartitions));
-
-                break;
-
-            case COOPERATIVE:
-                Set<TopicPartition> revokedPartitions = new HashSet<>(ownedPartitions);
-                revokedPartitions.removeAll(assignedPartitions);
-
-                log.info("Updating with newly assigned partitions: {}, compare with already owned partitions: {}, " +
-                        "newly added partitions: {}, revoking partitions: {}",
-                    Utils.join(assignedPartitions, ", "),
-                    Utils.join(ownedPartitions, ", "),
-                    Utils.join(addedPartitions, ", "),
-                    Utils.join(revokedPartitions, ", "));
-
-                // revoke partitions that was previously owned but no longer assigned;
-                // note that we should only change the assignment AFTER we've triggered
-                // the revoke callback
-                if (!revokedPartitions.isEmpty()) {
-                    firstException.compareAndSet(null, invokePartitionsRevoked(revokedPartitions));
-                }
-
-                subscriptions.assignFromSubscribed(assignedPartitions);
-
-                // add partitions that were not previously owned but are now assigned
-                firstException.compareAndSet(null, invokePartitionsAssigned(addedPartitions));
-
-                // if revoked any partitions, need to re-join the group afterwards
-                if (!revokedPartitions.isEmpty()) {
-                    requestRejoin();
-                }
-
-                break;
-        }
+        // add partitions that were not previously owned but are now assigned
+        firstException.compareAndSet(null, invokePartitionsAssigned(addedPartitions));
 
         if (firstException.get() != null)
             throw new KafkaException("User rebalance callback throws an error", firstException.get());
@@ -566,7 +557,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
         // when these topics gets updated from metadata refresh.
         //
         // TODO: this is a hack and not something we want to support long-term unless we push regex into the protocol
-        //       we may need to modify the PartitionAssignor API to better support this case.
+        //       we may need to modify the ConsumerPartitionAssignor API to better support this case.
         Set<String> assignedTopics = new HashSet<>();
         for (Assignment assigned : assignments.values()) {
             for (TopicPartition tp : assigned.partitions())
@@ -591,7 +582,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
         assignmentSnapshot = metadataSnapshot;
 
-        log.debug("Finished assignment for group: {}", assignments);
+        log.info("Finished assignment for group at generation {}: {}", generation().generationId, assignments);
 
         Map<String, ByteBuffer> groupAssignment = new HashMap<>();
         for (Map.Entry<String, Assignment> assignmentEntry : assignments.entrySet()) {
@@ -691,7 +682,6 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
             }
         }
 
-
         isLeader = false;
         subscriptions.resetGroupSubscription();
 
@@ -774,8 +764,9 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                                                                         final Timer timer) {
         if (partitions.isEmpty()) return Collections.emptyMap();
 
-        final Generation generation = generation();
-        if (pendingCommittedOffsetRequest != null && !pendingCommittedOffsetRequest.sameRequest(partitions, generation)) {
+        final Generation generationForOffsetRequest = generationIfStable();
+        if (pendingCommittedOffsetRequest != null &&
+            !pendingCommittedOffsetRequest.sameRequest(partitions, generationForOffsetRequest)) {
             // if we were waiting for a different request, then just clear it.
             pendingCommittedOffsetRequest = null;
         }
@@ -789,7 +780,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
                 future = pendingCommittedOffsetRequest.response;
             } else {
                 future = sendOffsetFetchRequest(partitions);
-                pendingCommittedOffsetRequest = new PendingCommittedOffsetRequest(partitions, generation, future);
+                pendingCommittedOffsetRequest = new PendingCommittedOffsetRequest(partitions, generationForOffsetRequest, future);
 
             }
             client.poll(future, timer);
@@ -1049,7 +1040,7 @@ public final class ConsumerCoordinator extends AbstractCoordinator {
 
         final Generation generation;
         if (subscriptions.partitionsAutoAssigned()) {
-            generation = generation();
+            generation = generationIfStable();
             // if the generation is null, we are not part of an active group (and we expect to be).
             // the only thing we can do is fail the commit and let the user rejoin the group in poll()
             if (generation == null) {
